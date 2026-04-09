@@ -2,25 +2,27 @@ import asyncio
 import logging
 import os
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.enums import ChatMemberStatus
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from dotenv import load_dotenv
 import yt_dlp
+import asyncpg
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Fallback to 0 if not set
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+db_pool = None
 
-# Simple in-memory storage for user languages (MVP version)
-user_langs = {}
-
+# ----------------- Translations -----------------
 LANG_TEXT = {
     "uz": {
         "welcome_sub": "👋 Xush kelibsiz!\n\nBotdan foydalanish uchun avval quyidagi kanalga obuna bo'ling:",
@@ -31,7 +33,7 @@ LANG_TEXT = {
         "welcome_download": "🎉 Video yuklab oluvchi botga xush kelibsiz!\n\nMenga TikTok yoki Instagram havolasini yuboring.",
         "sub_required": "🔒 Botdan foydalanish uchun kanalimizga obuna bo'lishingiz kerak:",
         "downloading": "⏳ Video yuklanmoqda... Iltimos kuting.",
-        "success_vid": "Mana sizning videongiz! 🎥",
+        "success_vid": "Mana sizning videongiz! 🎥\n\n@TargetSaver_bot",
         "fail_vid": "❌ Kechirasiz, videoni yuklab olib bo'lmadi. Havola to'g'riligini va akkaunt ochiqligini tekshiring."
     },
     "ru": {
@@ -43,7 +45,7 @@ LANG_TEXT = {
         "welcome_download": "🎉 Добро пожаловать в бота-загрузчика!\n\nОтправьте мне ссылку на TikTok или Instagram.",
         "sub_required": "🔒 Для использования бота необходимо подписаться на канал:",
         "downloading": "⏳ Загрузка видео... Пожалуйста, подождите.",
-        "success_vid": "Вот ваше видео! 🎥",
+        "success_vid": "Вот ваше видео! 🎥\n\n@TargetSaver_bot",
         "fail_vid": "❌ Извините, не удалось скачать видео. Проверьте ссылку и убедитесь, что аккаунт открыт."
     },
     "en": {
@@ -55,45 +57,86 @@ LANG_TEXT = {
         "welcome_download": "🎉 Welcome to the Video Downloader Bot!\n\nSend me a TikTok or Instagram link.",
         "sub_required": "🔒 You must be subscribed to our channel to use this bot:",
         "downloading": "⏳ Downloading video... Please wait.",
-        "success_vid": "Here is your video! 🎥",
+        "success_vid": "Here is your video! 🎥\n\n@TargetSaver_bot",
         "fail_vid": "❌ Sorry, couldn't download the video. Make sure the link is correct and the account is public."
     }
 }
 
-def get_lang_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang_uz"),
-            InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru"),
-        ],
-        [
-            InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")
-        ]
-    ])
+# ----------------- Database Functions -----------------
+async def init_db():
+    global db_pool
+    if not DATABASE_URL:
+        logging.warning("DATABASE_URL is not set. Bot will run without database tracking.")
+        return
+    
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username VARCHAR(255),
+                first_name VARCHAR(255),
+                language VARCHAR(10) DEFAULT 'uz',
+                downloads_count INT DEFAULT 0,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        logging.info("Database connection up and tables verified.")
 
-def get_sub_keyboard(lang="uz"):
-    text_data = LANG_TEXT.get(lang, LANG_TEXT["uz"])
-    channel_url = f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=text_data["btn_sub"], url=channel_url)],
-        [InlineKeyboardButton(text=text_data["btn_check"], callback_data="check_sub")]
-    ])
-    return keyboard
+async def upsert_user(user: types.User, lang: str = None):
+    if not db_pool: return
+    async with db_pool.acquire() as conn:
+        if lang:
+            await conn.execute('''
+                INSERT INTO users (user_id, username, first_name, language)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE 
+                SET username = EXCLUDED.username, first_name = EXCLUDED.first_name, language = EXCLUDED.language
+            ''', user.id, user.username, user.first_name, lang)
+        else:
+            await conn.execute('''
+                INSERT INTO users (user_id, username, first_name)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id) DO UPDATE 
+                SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
+            ''', user.id, user.username, user.first_name)
+
+async def get_user_lang(user_id: int) -> str:
+    if not db_pool: return "uz"
+    async with db_pool.acquire() as conn:
+        lang = await conn.fetchval("SELECT language FROM users WHERE user_id = $1", user_id)
+        return lang if lang else "uz"
+
+async def increment_downloads(user_id: int):
+    if not db_pool: return
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE users SET downloads_count = downloads_count + 1 WHERE user_id = $1", user_id)
 
 async def check_subscription(user_id: int) -> bool:
     if not REQUIRED_CHANNEL:
         return True
     try:
         member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
-        return member.status in [
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR
-        ]
+        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
     except Exception as e:
-        logging.error(f"Subscription check error: {e}")
         return False
 
+# ----------------- Keyboards -----------------
+def get_lang_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang_uz"), InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")],
+        [InlineKeyboardButton(text="🇬🇧 English", callback_data="lang_en")]
+    ])
+
+def get_sub_keyboard(lang="uz"):
+    text_data = LANG_TEXT.get(lang, LANG_TEXT["uz"])
+    channel_url = f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=text_data["btn_sub"], url=channel_url)],
+        [InlineKeyboardButton(text=text_data["btn_check"], callback_data="check_sub")]
+    ])
+
+# ----------------- Downloader Core -----------------
 def download_video(url: str, output_path: str = "temp_video.mp4") -> str:
     ydl_opts = {
         'outtmpl': output_path,
@@ -106,29 +149,38 @@ def download_video(url: str, output_path: str = "temp_video.mp4") -> str:
         ydl.download([url])
     return output_path
 
+# ----------------- User Handlers -----------------
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
-    user_id = message.from_user.id
-    if user_id not in user_langs:
+    await upsert_user(message.from_user)
+    lang = await get_user_lang(message.from_user.id)
+    
+    # Check if brand new user
+    if not db_pool:
+        # Fallback if no DB
+        await message.answer("Please choose your language:", reply_markup=get_lang_keyboard())
+        return
+        
+    async with db_pool.acquire() as conn:
+        val = await conn.fetchval("SELECT downloads_count FROM users WHERE user_id = $1", message.from_user.id)
+        
+    if val == 0:
         await message.answer("Please choose your language / Пожалуйста, выберите язык / Iltimos tilingizni tanlang:", reply_markup=get_lang_keyboard())
         return
 
-    lang = user_langs[user_id]
-    text_data = LANG_TEXT[lang]
-    is_subbed = await check_subscription(user_id)
+    is_subbed = await check_subscription(message.from_user.id)
     if not is_subbed:
-        await message.answer(text_data["welcome_sub"], reply_markup=get_sub_keyboard(lang))
+        await message.answer(LANG_TEXT[lang]["welcome_sub"], reply_markup=get_sub_keyboard(lang))
         return
-    await message.answer(text_data["welcome_download"])
+    await message.answer(LANG_TEXT[lang]["welcome_download"])
 
 @dp.callback_query(F.data.startswith("lang_"))
 async def lang_callback(callback: CallbackQuery):
     lang = callback.data.split("_")[1]
-    user_id = callback.from_user.id
-    user_langs[user_id] = lang
+    await upsert_user(callback.from_user, lang=lang)
     
     text_data = LANG_TEXT[lang]
-    is_subbed = await check_subscription(user_id)
+    is_subbed = await check_subscription(callback.from_user.id)
     
     if not is_subbed:
         await callback.message.edit_text(text_data["welcome_sub"], reply_markup=get_sub_keyboard(lang))
@@ -137,11 +189,10 @@ async def lang_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "check_sub")
 async def verify_sub_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    lang = user_langs.get(user_id, "uz")
+    lang = await get_user_lang(callback.from_user.id)
     text_data = LANG_TEXT[lang]
     
-    is_subbed = await check_subscription(user_id)
+    is_subbed = await check_subscription(callback.from_user.id)
     if is_subbed:
         await callback.message.edit_text(text_data["sub_success"])
     else:
@@ -149,12 +200,11 @@ async def verify_sub_callback(callback: CallbackQuery):
 
 @dp.message(F.text.regexp(r'(https?://(www\.)?(tiktok\.com|instagram\.com)/[^\s]+)'))
 async def process_link(message: types.Message):
-    user_id = message.from_user.id
-    lang = user_langs.get(user_id, "uz")
+    lang = await get_user_lang(message.from_user.id)
     text_data = LANG_TEXT[lang]
+    await upsert_user(message.from_user)
 
-    is_subbed = await check_subscription(user_id)
-    if not is_subbed:
+    if not await check_subscription(message.from_user.id):
         await message.answer(text_data["sub_required"], reply_markup=get_sub_keyboard(lang))
         return
 
@@ -163,7 +213,8 @@ async def process_link(message: types.Message):
 
     try:
         loop = asyncio.get_running_loop()
-        output_file = await loop.run_in_executor(None, download_video, url)
+        file_name = f"video_{message.from_user.id}_{message.message_id}.mp4"
+        output_file = await loop.run_in_executor(None, download_video, url, file_name)
 
         video = FSInputFile(output_file)
         await bot.send_video(
@@ -175,12 +226,66 @@ async def process_link(message: types.Message):
 
         os.remove(output_file)
         await processing_msg.delete()
+        await increment_downloads(message.from_user.id)
 
     except Exception as e:
         logging.error(f"Download failed: {e}")
         await processing_msg.edit_text(text_data["fail_vid"])
 
+# ----------------- Admin Commands -----------------
+@dp.message(Command("stats"))
+async def admin_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    if not db_pool:
+        await message.answer("Database is not connected.")
+        return
+
+    async with db_pool.acquire() as conn:
+        total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
+        total_downloads = await conn.fetchval("SELECT SUM(downloads_count) FROM users")
+    
+    await message.answer(f"📊 **TargetSave Bot Stats:**\n\n👥 Total Users: {total_users}\n🎥 Total Downloads: {total_downloads}")
+
+@dp.message(Command("broadcast"))
+async def broadcast_cmd(message: types.Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID: return
+    if not db_pool:
+        await message.answer("Database is not connected.")
+        return
+        
+    if not command.args:
+        await message.answer("To use broadast: `/broadcast Hello guys, check out my new video!`", parse_mode="Markdown")
+        return
+
+    msg_text = command.args
+    status_msg = await message.answer("⏳ Broadcast starting...")
+    
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT user_id FROM users")
+        
+    success = 0
+    fail = 0
+    for user_row in users:
+        try:
+            await bot.send_message(user_row['user_id'], msg_text)
+            success += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05) # Prevent Telegram Flood Limits
+
+    await status_msg.edit_text(f"✅ **Broadcast Complete!**\n\nDelivered: {success}\nFailed/Blocked: {fail}")
+
+# ----------------- Startup Hooks -----------------
+async def on_startup():
+    await init_db()
+
+async def on_shutdown():
+    if db_pool:
+        await db_pool.close()
+
 async def main():
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
