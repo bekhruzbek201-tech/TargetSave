@@ -177,7 +177,7 @@ async def download_media(url: str, output_path: str, is_audio: bool = False) -> 
     # Phase 2: Fallback to yt-dlp
     ydl_opts = {
         'outtmpl': output_path,
-        'format': 'bestaudio/best' if is_audio else 'b[height<=720][ext=mp4]/b[ext=mp4]/b',
+        'format': 'bestaudio/best' if is_audio else 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
         'quiet': True,
         'no_warnings': True,
     }
