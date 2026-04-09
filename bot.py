@@ -181,6 +181,10 @@ async def download_media(url: str, output_path: str, is_audio: bool = False) -> 
         'quiet': True,
         'no_warnings': True,
     }
+    
+    # Use cookies if available to prevent YouTube/Instagram blocking
+    if os.path.exists("cookies.txt"):
+        ydl_opts['cookiefile'] = 'cookies.txt'
 
     def _yt_dlp_run():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
