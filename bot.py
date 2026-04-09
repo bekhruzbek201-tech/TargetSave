@@ -8,13 +8,14 @@ from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButto
 from dotenv import load_dotenv
 import yt_dlp
 import asyncpg
+import aiohttp
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL")
 DATABASE_URL = os.getenv("DATABASE_URL")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Fallback to 0 if not set
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,35 +31,38 @@ LANG_TEXT = {
         "btn_check": "✅ Obunani tekshirish",
         "sub_success": "✅ Siz endi botdan bemalol foydalanishingiz mumkin!\n\nMenga TikTok yoki Instagram havolasini yuboring.",
         "sub_fail": "❌ Hali obuna bo'lmadingiz. Iltimos, kanalga a'zo bo'ling!",
-        "welcome_download": "🎉 Video yuklab oluvchi botga xush kelibsiz!\n\nMenga TikTok yoki Instagram havolasini yuboring.",
+        "welcome_download": "🎉 Video yuklab oluvchi botga xush kelibsiz!\n\nMenga YouTube, TikTok yoki Instagram havolasini yuboring.",
         "sub_required": "🔒 Botdan foydalanish uchun kanalimizga obuna bo'lishingiz kerak:",
-        "downloading": "⏳ Video yuklanmoqda... Iltimos kuting.",
-        "success_vid": "Mana sizning videongiz! 🎥\n\n@TargetSaver_bot",
-        "fail_vid": "❌ Kechirasiz, videoni yuklab olib bo'lmadi. Havola to'g'riligini va akkaunt ochiqligini tekshiring."
+        "choose_format": "👇 Qaysi formatda yuklab olamiz?",
+        "downloading": "⏳ Yuklanmoqda... Iltimos kuting.",
+        "success_vid": "Mana sizning faylingiz! 🎉\n\n@TargetSaver_bot",
+        "fail_vid": "❌ Kechirasiz, yuklab olib bo'lmadi. Video o'chirilgan, yopiq (private) yoki hajmi juda katta bo'lishi mumkin."
     },
     "ru": {
         "welcome_sub": "👋 Добро пожаловать!\n\nЧтобы использовать бота, подпишитесь на наш канал:",
         "btn_sub": "📢 Подписаться на канал",
         "btn_check": "✅ Проверить подписку",
-        "sub_success": "✅ Теперь вы можете использовать бота!\n\nОтправьте мне ссылку на TikTok или Instagram.",
+        "sub_success": "✅ Теперь вы можете использовать бота!\n\nОтправьте мне ссылку на YouTube, TikTok или Instagram.",
         "sub_fail": "❌ Вы еще не подписались. Пожалуйста, присоединитесь к каналу!",
-        "welcome_download": "🎉 Добро пожаловать в бота-загрузчика!\n\nОтправьте мне ссылку на TikTok или Instagram.",
+        "welcome_download": "🎉 Добро пожаловать в бота-загрузчика!\n\nОтправьте мне ссылку на YouTube, TikTok или Instagram.",
         "sub_required": "🔒 Для использования бота необходимо подписаться на канал:",
-        "downloading": "⏳ Загрузка видео... Пожалуйста, подождите.",
-        "success_vid": "Вот ваше видео! 🎥\n\n@TargetSaver_bot",
-        "fail_vid": "❌ Извините, не удалось скачать видео. Проверьте ссылку и убедитесь, что аккаунт открыт."
+        "choose_format": "👇 В каком формате скачать?",
+        "downloading": "⏳ Загрузка... Пожалуйста, подождите.",
+        "success_vid": "Вот ваш файл! 🎉\n\n@TargetSaver_bot",
+        "fail_vid": "❌ Извините, не удалось скачать файл. Видео может быть приватным, удалено или слишком большого размера."
     },
     "en": {
         "welcome_sub": "👋 Welcome!\n\nTo use this bot, please subscribe to our channel first:",
         "btn_sub": "📢 Subscribe to Channel",
         "btn_check": "✅ Check Subscription",
-        "sub_success": "✅ You can now use the bot freely!\n\nSend me a TikTok or Instagram link.",
+        "sub_success": "✅ You can now use the bot freely!\n\nSend me a YouTube, TikTok or Instagram link.",
         "sub_fail": "❌ You haven't subscribed yet. Please join the channel!",
-        "welcome_download": "🎉 Welcome to the Video Downloader Bot!\n\nSend me a TikTok or Instagram link.",
+        "welcome_download": "🎉 Welcome to the Media Downloader Bot!\n\nSend me a YouTube, TikTok or Instagram link.",
         "sub_required": "🔒 You must be subscribed to our channel to use this bot:",
-        "downloading": "⏳ Downloading video... Please wait.",
-        "success_vid": "Here is your video! 🎥\n\n@TargetSaver_bot",
-        "fail_vid": "❌ Sorry, couldn't download the video. Make sure the link is correct and the account is public."
+        "choose_format": "👇 Choose download format:",
+        "downloading": "⏳ Downloading... Please wait.",
+        "success_vid": "Here is your file! 🎉\n\n@TargetSaver_bot",
+        "fail_vid": "❌ Sorry, couldn't download. The content might be private, deleted, or too large."
     }
 }
 
@@ -66,9 +70,7 @@ LANG_TEXT = {
 async def init_db():
     global db_pool
     if not DATABASE_URL:
-        logging.warning("DATABASE_URL is not set. Bot will run without database tracking.")
         return
-    
     db_pool = await asyncpg.create_pool(DATABASE_URL)
     async with db_pool.acquire() as conn:
         await conn.execute('''
@@ -81,7 +83,6 @@ async def init_db():
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        logging.info("Database connection up and tables verified.")
 
 async def upsert_user(user: types.User, lang: str = None):
     if not db_pool: return
@@ -118,7 +119,7 @@ async def check_subscription(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
         return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
-    except Exception as e:
+    except Exception:
         return False
 
 # ----------------- Keyboards -----------------
@@ -130,16 +131,22 @@ def get_lang_keyboard():
 
 def get_sub_keyboard(lang="uz"):
     text_data = LANG_TEXT.get(lang, LANG_TEXT["uz"])
-    channel_url = f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}"
+    channel_url = f"https://t.me/{REQUIRED_CHANNEL.replace('@', '')}" if REQUIRED_CHANNEL else ""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=text_data["btn_sub"], url=channel_url)],
         [InlineKeyboardButton(text=text_data["btn_check"], callback_data="check_sub")]
     ])
 
-import aiohttp
+def get_format_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎬 Video (720p)", callback_data="dl_video"),
+            InlineKeyboardButton(text="🎵 Audio (MP3)", callback_data="dl_audio")
+        ]
+    ])
 
 # ----------------- Downloader Core -----------------
-async def download_video(url: str, output_path: str) -> str:
+async def download_media(url: str, output_path: str, is_audio: bool = False) -> str:
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -147,20 +154,22 @@ async def download_video(url: str, output_path: str) -> str:
     }
     payload = {
         "url": url,
-        "vQuality": "1080"
+        "vQuality": "720", # Restricted to 720p to prevent Telegram 50MB limits on long videos
+        "isAudioOnly": is_audio
     }
     
-    # Phase 1: Try Cobalt API (Bypasses AWS IP blocks)
+    # Phase 1: Try Cobalt API
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post("https://api.cobalt.tools/api/json", json=payload, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    video_url = data.get("url")
-                    if video_url:
-                        async with session.get(video_url) as file_resp:
+                    media_url = data.get("url")
+                    if media_url:
+                        async with session.get(media_url) as file_resp:
                             with open(output_path, 'wb') as f:
-                                f.write(await file_resp.read())
+                                while chunk := await file_resp.content.read(8192):
+                                    f.write(chunk)
                         return output_path
     except Exception as e:
         logging.warning(f"Cobalt download failed: {e}. Trying fallback...")
@@ -168,11 +177,16 @@ async def download_video(url: str, output_path: str) -> str:
     # Phase 2: Fallback to yt-dlp
     ydl_opts = {
         'outtmpl': output_path,
-        'format': 'best',
+        'format': 'bestaudio/best' if is_audio else 'best[height<=720]/best',
         'quiet': True,
         'no_warnings': True,
-        'merge_output_format': 'mp4'
     }
+    if not is_audio:
+        ydl_opts['merge_output_format'] = 'mp4'
+    else:
+        ydl_opts['extract_audio'] = True
+        ydl_opts['audio_format'] = 'mp3'
+
     def _yt_dlp_run():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -187,9 +201,7 @@ async def start_cmd(message: types.Message):
     await upsert_user(message.from_user)
     lang = await get_user_lang(message.from_user.id)
     
-    # Check if brand new user
     if not db_pool:
-        # Fallback if no DB
         await message.answer("Please choose your language:", reply_markup=get_lang_keyboard())
         return
         
@@ -230,8 +242,9 @@ async def verify_sub_callback(callback: CallbackQuery):
     else:
         await callback.answer(text_data["sub_fail"], show_alert=True)
 
+# Detect Links and send format choice
 @dp.message(F.text.regexp(r'(https?://(www\.)?(tiktok\.com|instagram\.com|youtube\.com|youtu\.be)/[^\s]+)'))
-async def process_link(message: types.Message):
+async def initiate_download(message: types.Message):
     lang = await get_user_lang(message.from_user.id)
     text_data = LANG_TEXT[lang]
     await upsert_user(message.from_user)
@@ -240,28 +253,55 @@ async def process_link(message: types.Message):
         await message.answer(text_data["sub_required"], reply_markup=get_sub_keyboard(lang))
         return
 
-    url = message.text
-    processing_msg = await message.answer(text_data["downloading"])
+    # Reply to user's message with options
+    await message.reply(text_data["choose_format"], reply_markup=get_format_keyboard())
+
+# Handle format selection
+@dp.callback_query(F.data.in_({"dl_video", "dl_audio"}))
+async def process_download_choice(callback: CallbackQuery):
+    url_msg = callback.message.reply_to_message
+    if not url_msg or not url_msg.text:
+        await callback.answer("Error: URL not found", show_alert=True)
+        return
+
+    url = url_msg.text
+    is_audio = callback.data == "dl_audio"
+    
+    lang = await get_user_lang(callback.from_user.id)
+    text_data = LANG_TEXT[lang]
+    
+    # Switch keyboard to downloading text
+    await callback.message.edit_text(text_data["downloading"])
+    
+    ext = "mp3" if is_audio else "mp4"
+    file_name = f"media_{callback.from_user.id}_{callback.message.message_id}.{ext}"
 
     try:
-        file_name = f"video_{message.from_user.id}_{message.message_id}.mp4"
-        output_file = await download_video(url, file_name)
+        output_file = await download_media(url, file_name, is_audio)
+        media = FSInputFile(output_file)
 
-        video = FSInputFile(output_file)
-        await bot.send_video(
-            chat_id=message.chat.id,
-            video=video,
-            caption=f"{text_data['success_vid']}",
-            reply_to_message_id=message.message_id
-        )
+        if is_audio:
+            await bot.send_audio(
+                chat_id=callback.message.chat.id,
+                audio=media,
+                caption=text_data['success_vid'],
+                reply_to_message_id=url_msg.message_id
+            )
+        else:
+            await bot.send_video(
+                chat_id=callback.message.chat.id,
+                video=media,
+                caption=text_data['success_vid'],
+                reply_to_message_id=url_msg.message_id
+            )
 
         os.remove(output_file)
-        await processing_msg.delete()
-        await increment_downloads(message.from_user.id)
+        await callback.message.delete()
+        await increment_downloads(callback.from_user.id)
 
     except Exception as e:
         logging.error(f"Download failed: {e}")
-        await processing_msg.edit_text(text_data["fail_vid"])
+        await callback.message.edit_text(text_data["fail_vid"])
 
 # ----------------- Admin Commands -----------------
 @dp.message(Command("stats"))
@@ -280,9 +320,7 @@ async def admin_stats(message: types.Message):
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: types.Message, command: CommandObject):
     if message.from_user.id != ADMIN_ID: return
-    if not db_pool:
-        await message.answer("Database is not connected.")
-        return
+    if not db_pool: return
         
     if not command.args:
         await message.answer("To use broadast: `/broadcast Hello guys, check out my new video!`", parse_mode="Markdown")
@@ -302,7 +340,7 @@ async def broadcast_cmd(message: types.Message, command: CommandObject):
             success += 1
         except Exception:
             fail += 1
-        await asyncio.sleep(0.05) # Prevent Telegram Flood Limits
+        await asyncio.sleep(0.05) 
 
     await status_msg.edit_text(f"✅ **Broadcast Complete!**\n\nDelivered: {success}\nFailed/Blocked: {fail}")
 
