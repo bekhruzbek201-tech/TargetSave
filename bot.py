@@ -177,15 +177,10 @@ async def download_media(url: str, output_path: str, is_audio: bool = False) -> 
     # Phase 2: Fallback to yt-dlp
     ydl_opts = {
         'outtmpl': output_path,
-        'format': 'bestaudio/best' if is_audio else 'best[height<=720]/best',
+        'format': 'bestaudio/best' if is_audio else 'b[height<=720][ext=mp4]/b[ext=mp4]/b',
         'quiet': True,
         'no_warnings': True,
     }
-    if not is_audio:
-        ydl_opts['merge_output_format'] = 'mp4'
-    else:
-        ydl_opts['extract_audio'] = True
-        ydl_opts['audio_format'] = 'mp3'
 
     def _yt_dlp_run():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -253,10 +248,36 @@ async def initiate_download(message: types.Message):
         await message.answer(text_data["sub_required"], reply_markup=get_sub_keyboard(lang))
         return
 
-    # Reply to user's message with options
-    await message.reply(text_data["choose_format"], reply_markup=get_format_keyboard())
+    url = message.text
+    if "youtube.com" in url or "youtu.be" in url:
+        await message.reply(text_data["choose_format"], reply_markup=get_format_keyboard())
+    else:
+        # Instant processing for IG and TikTok
+        processing_msg = await message.answer(text_data["downloading"])
+        await execute_download(message.from_user.id, message.chat.id, message.message_id, url, False, processing_msg, text_data)
 
-# Handle format selection
+async def execute_download(user_id: int, chat_id: int, reply_msg_id: int, url: str, is_audio: bool, status_msg: types.Message, text_data: dict):
+    ext = "m4a" if is_audio else "mp4" # Prevent ffmpeg crash
+    file_name = f"media_{user_id}_{reply_msg_id}.{ext}"
+
+    try:
+        output_file = await download_media(url, file_name, is_audio)
+        media = FSInputFile(output_file)
+
+        if is_audio:
+            await bot.send_audio(chat_id=chat_id, audio=media, caption=text_data['success_vid'], reply_to_message_id=reply_msg_id)
+        else:
+            await bot.send_video(chat_id=chat_id, video=media, caption=text_data['success_vid'], reply_to_message_id=reply_msg_id)
+
+        os.remove(output_file)
+        await status_msg.delete()
+        await increment_downloads(user_id)
+
+    except Exception as e:
+        logging.error(f"Download failed: {e}")
+        await status_msg.edit_text(text_data["fail_vid"])
+
+# Handle format selection for YouTube
 @dp.callback_query(F.data.in_({"dl_video", "dl_audio"}))
 async def process_download_choice(callback: CallbackQuery):
     url_msg = callback.message.reply_to_message
@@ -270,38 +291,8 @@ async def process_download_choice(callback: CallbackQuery):
     lang = await get_user_lang(callback.from_user.id)
     text_data = LANG_TEXT[lang]
     
-    # Switch keyboard to downloading text
     await callback.message.edit_text(text_data["downloading"])
-    
-    ext = "mp3" if is_audio else "mp4"
-    file_name = f"media_{callback.from_user.id}_{callback.message.message_id}.{ext}"
-
-    try:
-        output_file = await download_media(url, file_name, is_audio)
-        media = FSInputFile(output_file)
-
-        if is_audio:
-            await bot.send_audio(
-                chat_id=callback.message.chat.id,
-                audio=media,
-                caption=text_data['success_vid'],
-                reply_to_message_id=url_msg.message_id
-            )
-        else:
-            await bot.send_video(
-                chat_id=callback.message.chat.id,
-                video=media,
-                caption=text_data['success_vid'],
-                reply_to_message_id=url_msg.message_id
-            )
-
-        os.remove(output_file)
-        await callback.message.delete()
-        await increment_downloads(callback.from_user.id)
-
-    except Exception as e:
-        logging.error(f"Download failed: {e}")
-        await callback.message.edit_text(text_data["fail_vid"])
+    await execute_download(callback.from_user.id, callback.message.chat.id, url_msg.message_id, url, is_audio, callback.message, text_data)
 
 # ----------------- Admin Commands -----------------
 @dp.message(Command("stats"))
