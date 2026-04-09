@@ -230,7 +230,7 @@ async def verify_sub_callback(callback: CallbackQuery):
     else:
         await callback.answer(text_data["sub_fail"], show_alert=True)
 
-@dp.message(F.text.regexp(r'(https?://(www\.)?(tiktok\.com|instagram\.com)/[^\s]+)'))
+@dp.message(F.text.regexp(r'(https?://(www\.)?(tiktok\.com|instagram\.com|youtube\.com|youtu\.be)/[^\s]+)'))
 async def process_link(message: types.Message):
     lang = await get_user_lang(message.from_user.id)
     text_data = LANG_TEXT[lang]
