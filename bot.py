@@ -136,8 +136,36 @@ def get_sub_keyboard(lang="uz"):
         [InlineKeyboardButton(text=text_data["btn_check"], callback_data="check_sub")]
     ])
 
+import aiohttp
+
 # ----------------- Downloader Core -----------------
-def download_video(url: str, output_path: str = "temp_video.mp4") -> str:
+async def download_video(url: str, output_path: str) -> str:
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    }
+    payload = {
+        "url": url,
+        "vQuality": "1080"
+    }
+    
+    # Phase 1: Try Cobalt API (Bypasses AWS IP blocks)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://api.cobalt.tools/api/json", json=payload, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    video_url = data.get("url")
+                    if video_url:
+                        async with session.get(video_url) as file_resp:
+                            with open(output_path, 'wb') as f:
+                                f.write(await file_resp.read())
+                        return output_path
+    except Exception as e:
+        logging.warning(f"Cobalt download failed: {e}. Trying fallback...")
+
+    # Phase 2: Fallback to yt-dlp
     ydl_opts = {
         'outtmpl': output_path,
         'format': 'best',
@@ -145,8 +173,12 @@ def download_video(url: str, output_path: str = "temp_video.mp4") -> str:
         'no_warnings': True,
         'merge_output_format': 'mp4'
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    def _yt_dlp_run():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _yt_dlp_run)
     return output_path
 
 # ----------------- User Handlers -----------------
@@ -212,9 +244,8 @@ async def process_link(message: types.Message):
     processing_msg = await message.answer(text_data["downloading"])
 
     try:
-        loop = asyncio.get_running_loop()
         file_name = f"video_{message.from_user.id}_{message.message_id}.mp4"
-        output_file = await loop.run_in_executor(None, download_video, url, file_name)
+        output_file = await download_video(url, file_name)
 
         video = FSInputFile(output_file)
         await bot.send_video(
